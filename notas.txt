@@ -1,1 +1,50 @@
 .\.venv\Scripts\Activate.ps1 ACTIVAR EL ENVIRONMENT
+Que contiene carpeta data
+logs_backend --> Telemetría. Base a la que va a consultar search logs_backend
+ground truth --> Información que va a usar el judge
+
+Parte de la arquitectura que cumplen 
+Definición del red team runner
+Cyber-range representado por assets, roles, subredes en config
+Backend A
+Seed Controller -- Semilla para la reproducibilidad
+Ground truth -- Evaluación del blue team y medir métricas
+
+Que hace cada archivo.py
+Config.py:
+Listamos assets (host, ip, role, criticidad) y usuarios
+Tareas: Fuente unica de verdad del inventario del laboratorio
+Esto va a alimentar la generacion de lgos, va a servir para la parte del contexto y la logica del blue team( si el activo es hig, acciones más agresivas)
+Parte de la arquitectura -- Bloque cyber range virtual
+
+*************************************************************************************
+Models.py
+Definición de eventos. Estandarización de la Telemetría en formato consultable.
+Esto va a ser la base para el search logs_backend
+Campos:
+timestamp, episode_id, seed
+
+event_type (auth/network/process…)
+
+host, user, src_ip, dst_ip
+
+action, outcome, severity
+
+opcionales: process_name, tags
+Definición del ground truth:
+    Campos:
+        scenario_name, technique_ids (referencial)
+        t0, injected_window
+        expected_indicators (IPs/hosts/users que deberían aparecer)
+Respuesta correcta por episodio. Sirve para que el judge compara decisiones del blue team 
+arquitectura: Conecta con el bloque del juez y rigor academico( reproducibilidad y Evaluación)
+*******************************************************************************************
+Scenarios.py
+    Lista de escenarios con nombre, tecnica ATTYCK y descripción 
+    Que hace:
+        Define tipo de incidente que se inyecta. Parte determinista del red team
+        arquitectura: Alineado con MITRE ATTYCK
+***************************************************************************************
+generate_episodes.py
+    Núcleo de la fase 1
+    

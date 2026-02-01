@@ -26,6 +26,58 @@ def choose_asset(rng: random.Random, role: Optional[str] = None):
     cands = ASSETS if role is None else [a for a in ASSETS if a.role == role]
     return rng.choice(cands)
 
+# --- Reglas simples para variar severidad/tags en ruido benigno ---
+
+SERVICE_ACCOUNTS = {"svc_backup"}
+SCANNER_IPS = {"10.0.10.99"}          # IPs benignas que generan ruido (escáner interno)
+MAINTENANCE_HOSTS = {"web-01"}        # hosts con mantenimiento frecuente
+ALLOWLIST_USERS = {"svc_backup"}      # allowlist simple por usuario
+
+COMMON_PROCESSES = {"chrome.exe", "systemd", "sshd", "python"}
+SUSPICIOUS_BUT_BENIGN = {"python"}    # ejemplo: genera FP en algunos contextos (opcional)
+
+def assign_noise_severity_and_tags(event_type: str, action: str, outcome: str,
+                                   user: str | None, process_name: str | None) -> tuple[str, list[str]]:
+    tags = ["benign"]
+
+    # Base
+    severity = "low"
+
+    # 1) Auth failures generan más severidad (ruido que parece ataque)
+    if event_type == "auth" and action == "login_attempt" and outcome == "fail":
+        severity = "medium"
+        tags += ["auth_fail"]
+
+    # 2) Service accounts suelen ser benignas pero ruidosas
+    if user in SERVICE_ACCOUNTS:
+        tags += ["service_account"]
+        # si además falló auth, que quede medium (ya está)
+        if severity == "low":
+            severity = "low"
+
+    # 3) Procesos “raros” (o poco comunes) -> medium (para simular falsos positivos)
+    if event_type == "process":
+        if process_name is None:
+            severity = "medium"
+            tags += ["missing_process_name"]
+        elif process_name not in COMMON_PROCESSES:
+            severity = "medium"
+            tags += ["uncommon_process"]
+        elif process_name in SUSPICIOUS_BUT_BENIGN:
+            tags += ["noisy_process"]  # sigue siendo benigno pero “sospechoso”
+
+    # 4) Network: conexiones/dns normalmente low, pero algunas se vuelven noisy
+    if event_type == "network" and action in {"dns_query", "connect"}:
+        tags += ["network_noise"]
+
+    # 5) Allowlist / maintenance tags (para que luego FAISS aprenda FP)
+    if user in ALLOWLIST_USERS:
+        tags += ["allowlisted_user"]
+    if action == "process_start" and user == "admin":
+        tags += ["admin_activity"]
+    # Nota: si quieres maintenance_window real, lo modelamos por tiempo/host (ver abajo en el cambio)
+
+    return severity, tags
 
 def background_noise_events(
     rng: random.Random,
@@ -35,6 +87,29 @@ def background_noise_events(
     n: int,
 ) -> List[Event]:
     events: List[Event] = []
+        # Burst benigno: ráfaga de auth_fail (parece ataque, pero es ruido)
+    if rng.random() < 0.08:  # 8% de episodios con burst
+        asset = choose_asset(rng)
+        user = rng.choice(USERS)
+        base_dt = start + timedelta(seconds=rng.randint(1, 120))
+        for k in range(8):
+            dt = base_dt + timedelta(seconds=2*k)
+            severity, tags = assign_noise_severity_and_tags("auth", "login_attempt", "fail", user, None)
+            events.append(Event(
+                timestamp=iso(dt),
+                episode_id=episode_id, seed=seed,
+                event_type="auth",
+                host=asset["host"],
+                user=user,
+                src_ip=asset["ip"],
+                dst_ip=None,
+                action="login_attempt",
+                outcome="fail",
+                severity=severity,
+                process_name="systemd",
+                tags=tags + ["burst"]
+            ))
+
     for _ in range(n):
         dt = start + timedelta(seconds=rng.randint(1, 600))
         asset = choose_asset(rng)
@@ -50,7 +125,12 @@ def background_noise_events(
         else:
             action = rng.choice(["process_start", "process_end"])
             outcome = "success"
-
+        
+        process = rng.choice([None, "chrome.exe", "sshd", "unknown_tool", "python"])
+        severity, tags = assign_noise_severity_and_tags(
+            ev_type, action, outcome, user, process
+        )
+                
         events.append(Event(
             timestamp=iso(dt),
             episode_id=episode_id,
@@ -62,9 +142,9 @@ def background_noise_events(
             dst_ip=None,
             action=action,
             outcome=outcome,
-            severity="low",
-            process_name=rng.choice(["chrome.exe", "sshd", "systemd", "python", None]),
-            tags=["benign"],
+            severity=severity,
+            process_name=process,
+            tags=tags,
         ))
     return events
 

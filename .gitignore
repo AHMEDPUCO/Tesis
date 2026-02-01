@@ -1,7 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
-
+notas.txt
 data/
 .DS_Store
 .vscode/
