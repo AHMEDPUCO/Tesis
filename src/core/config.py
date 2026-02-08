@@ -19,3 +19,14 @@ ASSETS: List[Asset] = [
 ]
 # Definición de usuarios en el entorno de ciberseguridad
 USERS = ["alice", "bob", "svc_backup", "admin"]
+ASSET_METADATA = {
+  "db-01": {
+    "owner": "IT/Sistemas",
+    "allowlists": {
+      "users": ["svc_backup"],
+      "src_ips": ["10.0.10.99"],
+      "tags": ["maintenance_window"]
+    }
+  }
+}
+

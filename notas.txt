@@ -48,3 +48,8 @@ Scenarios.py
 generate_episodes.py
     Núcleo de la fase 1
     
+08/02/2026
+Desarrollo del mvp de la fase 2 que incluye consulta al backend a, decisión, acción simulada y metricas (judge)
+Comandos para correr y hacer pruebas completas
+python -m src.run_phase2_baseline
+python -m src.judge.judge_mttd_mttr
