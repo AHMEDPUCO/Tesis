@@ -53,3 +53,257 @@ Desarrollo del mvp de la fase 2 que incluye consulta al backend a, decisión, ac
 Comandos para correr y hacer pruebas completas
 python -m src.run_phase2_baseline
 python -m src.judge.judge_mttd_mttr
+Perfecto — aquí tienes el texto **listo para pegar** siguiendo tu formato, pero ahora **para la Fase 2 (MVP: Backend A + decisiones + acción simulada + métricas)**.
+
+---
+
+# ✅ 08/02/2026 — Fase 2 (MVP mínimo: Backend A + métricas + baseline)
+
+## Activación del environment
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+---
+
+## 📁 ¿Qué contiene la carpeta `data/`?
+
+* `data/logs_backend_a/`
+  **Telemetría (JSONL por episodio).**
+  Es la “base” que consulta `search_logs()` en Backend A.
+
+* `data/ground_truth/`
+  **Ground truth por episodio (JSON).**
+  Lo consume el Judge para calcular MTTD/MTTR.
+
+* `data/decisions/`
+  **Decisiones del Blue pipeline (JSONL).**
+  Cada fila representa lo que “decidió” el sistema por episodio (detección, evidencia, razón).
+
+* `data/actions/`
+  **Acciones de contención simuladas (JSONL).**
+  Se registra `block_ip` con `action_time` (timestamp del mundo simulado).
+
+* `data/results/`
+  **Resultados finales en CSV** (por ejemplo `results_phase2.csv`) con MTTD/MTTR.
+
+---
+
+## 🧱 Parte de la arquitectura que cumple esta Fase 2
+
+✅ **Backend A (JSON local)**
+
+* Ya existe `search_logs()` para consultar la telemetría por filtros/rango/limit/top-k.
+
+✅ **Cyber-range representado por Assets (config)**
+
+* `get_asset_context()` devuelve contexto del activo para enriquecer decisiones.
+
+✅ **Acciones defensivas simuladas**
+
+* `block_ip()` no bloquea realmente: **registra** una acción para auditoría y métricas.
+
+✅ **Judge (métricas)**
+
+* Calcula **MTTD/MTTR** comparando ground truth vs. decisiones/acciones.
+
+✅ **Runner baseline**
+
+* Ejecuta episodios en batch y genera decisiones + acciones simuladas.
+
+> Importante: en este MVP **todavía no hay Blue AI Agent**.
+> El “Blue” actual es un baseline heurístico que valida el pipeline end-to-end. El agente IA entra en el siguiente paso de Fase 2/3.
+
+---
+
+# 🧩 ¿Qué hace cada archivo de Fase 2?
+
+## 1) `src/backend_a/search_logs.py`
+
+**Función principal:** `search_logs()`
+
+### Qué hace
+
+* Lee archivos `episode_XXX.jsonl`
+* Aplica:
+
+  * filtro por `episode_id`
+  * rango de tiempo `start/end`
+  * filtros por campos (`host/user/src_ip/event_type/action/tags…`)
+  * `limit`
+  * agregación simple (`count`, `top_k`)
+
+### Para qué sirve
+
+* Es el equivalente “SIEM-lite” para que el Blue Team investigue con queries.
+
+### Resultado validado
+
+Ejemplo: filtró correctamente eventos `auth_fail` y devolvió:
+
+* `matched: 165`
+* `returned: 5` (por `limit=5`)
+* con tags y severidad coherentes (`medium`, `auth_fail`, `service_account`, etc.)
+
+---
+
+## 2) `src/tools/asset_context.py`
+
+**Función principal:** `get_asset_context(host_or_ip)`
+
+### Qué hace
+
+* Busca un asset por `host` o `ip` usando `src/core/config.py`
+* Devuelve contexto:
+
+  * host, ip, role, criticality
+  * (opcional) metadata extra definida explícitamente en config (no hardcode)
+
+### Para qué sirve
+
+* Enriquecimiento: el Blue pipeline decide distinto si el activo es `high` (ej: DB).
+
+### Resultado validado
+
+* `db-01` → encontrado, `criticality=high`
+* `10.0.10.21` → encontrado, `ws-01`
+* `no-existe` → `asset_not_found`
+
+---
+
+## 3) `src/tools/enforcement.py`
+
+**Función principal:** `block_ip(ip, duration, action_time=...)`
+
+### Qué hace
+
+* Simula contención: **no bloquea en firewall real**
+* Registra acción en `data/actions/enforcement_actions.jsonl`
+* Usa `action_time` (tiempo simulado del episodio) para consistencia temporal
+
+### Para qué sirve
+
+* Auditoría y métricas: el Judge usa el timestamp del bloqueo para MTTR.
+
+✅ Fix aplicado: antes salía MTTR negativo porque se guardaba “hora real”, ahora usa “hora simulada”.
+
+---
+
+## 4) `src/blue/decision_log.py`
+
+**Función principal:** `append_decision(...)`
+
+### Qué hace
+
+* Guarda una decisión por episodio en `data/decisions/decisions.jsonl`:
+
+  * `episode_id`
+  * `t_detect`
+  * `decision` (`block_ip` / `no_block` / `escalate`)
+  * `reason`
+  * `evidence` (evento que motivó la decisión + contexto del asset)
+
+### Para qué sirve
+
+* Trazabilidad y reproducción: explica por qué se tomó cada acción.
+
+---
+
+## 5) `src/judge/judge_mttd_mttr.py`
+
+**Función principal:** `judge_mttd_mttr()`
+
+### Qué hace
+
+* Lee:
+
+  * `data/ground_truth/*.json` → `inj_start`
+  * `data/decisions/decisions.jsonl` → `t_detect`
+  * `data/actions/enforcement_actions.jsonl` → `t_block`
+* Calcula:
+
+  * **MTTD = t_detect - inj_start**
+  * **MTTR = t_block - inj_start**
+* Escribe CSV final: `data/results/results_phase2.csv`
+
+### Para qué sirve
+
+* Entrega métricas cuantitativas reproducibles (base académica del experimento).
+
+---
+
+## 6) `src/run_phase_2_baseline.py`
+
+**Runner baseline (sin IA todavía)**
+
+### Qué hace
+
+* Lista episodios disponibles en `data/logs_backend_a`
+* Encuentra señal sospechosa por tags (ej. `suspicious`, `lateral_like`, etc.)
+* Enrich con `get_asset_context`
+* Decide con heurística:
+
+  * si `severity in (medium/high)` y **no allowlisted** → `block_ip`
+* Registra:
+
+  * decisión (decision_log)
+  * acción (enforcement)
+* Ejecuta Judge y genera CSV final
+
+### Resultado obtenido
+
+Inicialmente MTTR salía negativo por timestamp real → se corrigió usando `action_time=t_detect+30s`.
+
+---
+
+# ▶️ Comandos para ejecutar pruebas completas
+
+```powershell
+python -m src.run_phase_2_baseline
+python -m src.judge.judge_mttd_mttr
+```
+
+---
+
+# 📊 Resultados obtenidos (ejemplo)
+
+En `data/results/results_phase2.csv`:
+
+```csv
+episode_id,decision,inj_start,t_detect,t_block,MTTD_seconds,MTTR_seconds
+1,block_ip,2026-02-19T10:11:00Z,2026-02-19T10:11:00Z,2026-02-19T10:11:30Z,0.0,30.0
+```
+
+Interpretación:
+
+* MTTD = 0s → detección inmediata (baseline encontró el evento exacto)
+* MTTR = 30s → respuesta simulada 30s después
+
+---
+
+# ✅ Estado final de Fase 2 (MVP mínimo)
+
+**Listo y funcionando:**
+
+* Backend A consultable (`search_logs`)
+* Enrichment (`get_asset_context`)
+* Acción simulada (`block_ip`)
+* Decision logging
+* Judge MTTD/MTTR
+* Runner baseline end-to-end
+
+**Siguiente paso (ya con IA):**
+
+* Implementar **Blue Team AI Agent** (LangGraph) usando:    
+
+  * `search_logs`
+  * `get_asset_context`
+  * `retrieve_memory` (FAISS)
+  * `decide` + gating/HITL (simulado)
+  * `block_ip`
+
+---
+
+Si quieres, el próximo mensaje lo hacemos así: **“Fase 2.5: introducir FAISS (memoria) + retrieve_memory()”** para que luego el Blue Agent IA solo “consuma” esa interfaz.
+
