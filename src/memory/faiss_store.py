@@ -59,8 +59,16 @@ class FaissMemory:
             embs = embs.reshape(1, -1)
         return _l2_normalize(embs)
 
+    def reset(self) -> None:
+        #borra casos e índice pero mantiene la carpeta y el índice vacío
+        os.makedirs(self.dir_path, exist_ok=True)
+        open(self.cases_path, "w", encoding="utf-8").close()
+        self.cases = []
+        self.index = faiss.IndexFlatIP(self.dim)
+        self._persist_index()
+        
     def _load(self) -> None:
-        # casos
+    # carga casos
         self.cases = []
         if os.path.exists(self.cases_path):
             with open(self.cases_path, "r", encoding="utf-8") as f:
@@ -69,10 +77,15 @@ class FaissMemory:
                     if line:
                         self.cases.append(json.loads(line))
 
-        # índice
+        # carga/reconstruye índice con sanity check
+        need_rebuild = True
         if os.path.exists(self.index_path) and len(self.cases) > 0:
-            self.index = faiss.read_index(self.index_path)
-        else:
+            idx = faiss.read_index(self.index_path)
+            if getattr(idx, "d", None) == self.dim and idx.ntotal == len(self.cases):
+                self.index = idx
+                need_rebuild = False
+
+        if need_rebuild:
             self.index = faiss.IndexFlatIP(self.dim)
             if len(self.cases) > 0:
                 embs = self._embed([c["text"] for c in self.cases])
@@ -111,6 +124,16 @@ class FaissMemory:
         self.index.add(self._embed([text]))
         self._persist_index()
         return case
+    def clear(self) -> None:
+        # borra casos e índice
+        self.cases = []
+        self.index = faiss.IndexFlatIP(self.dim)
+        if os.path.exists(self.cases_path):
+            os.remove(self.cases_path)
+        if os.path.exists(self.index_path):
+            os.remove(self.index_path)
+        os.makedirs(self.dir_path, exist_ok=True)
+        self._persist_index()
 
     def search(self, *, text: str, k: int = 3, threshold: float = 0.75) -> List[MemoryHit]:
         if not self.cases:

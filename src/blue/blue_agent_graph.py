@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
+import os
 from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import StateGraph, END
+import os
 
 from src.backend_a.search_logs import search_logs
 from src.tools.asset_context import get_asset_context
-from src.tools.enforcement import block_ip
+from src.tools.enforcement import _iso_now, block_ip
 from src.blue.decision_log import append_decision
 
 ##Faiss memory importado pero no integrado aún (ver retrieve_memory):
@@ -17,6 +19,16 @@ from src.memory.faiss_store import FaissMemory
 
 
 #-----------------faiss_memory-----------------"
+# arriba del todo
+_MEM_BY_DIR: dict[str, FaissMemory] = {}
+
+def get_memory(dir_path: str) -> FaissMemory:
+    m = _MEM_BY_DIR.get(dir_path)
+    if m is None:
+        m = FaissMemory(dir_path=dir_path)
+        _MEM_BY_DIR[dir_path] = m
+    return m
+
 # Cache global para evitar recargar el índice en cada llamada (si decides usarlo)"
 _MEM: FaissMemory | None = None
 def get_memory() -> FaissMemory:
@@ -85,7 +97,11 @@ class BlueState(TypedDict, total=False):
     asset_context: Dict[str, Any]
     memory_hits: List[Dict[str, Any]]
     correlation: Dict[str, Any]
-
+    #run context
+    run_id: Optional[str]
+    decisions_path: Optional[str]
+    actions_path: Optional[str]
+    ##########
     # decisión/acción
     decision: str                          # block_ip | no_block | escalate
     confidence: float
@@ -309,6 +325,8 @@ def act(state: BlueState) -> BlueState:
                     episode_id=state["episode_id"],
                     reason=f"blue_agent: {state.get('decision_reason')}",
                     action_time=t_block,
+                    out_path=state.get("actions_path"),
+                    run_id=state.get("run_id"),
                 )
             else:
                 approved = False
@@ -328,61 +346,63 @@ def act(state: BlueState) -> BlueState:
 def log(state: BlueState) -> BlueState:
     ep = state["episode_id"]
 
+    # === Run context (para no mezclar corridas) ===
+    run_id = state.get("run_id")
+    decisions_path = state.get("decisions_path") or os.path.join("data", "runs", run_id or "unknown_run", "decisions.jsonl")
+    actions_path = state.get("actions_path") or os.path.join("data", "runs", run_id or "unknown_run", "enforcement_actions.jsonl")
+    # === decisiones ===
     proposed = state.get("proposed_decision", state.get("decision", "no_block"))
     final = state.get("final_decision", proposed)
 
-    reason = state.get("decision_reason", "")
     gating = state.get("gating") or {}
+    approved = bool(gating.get("approved", state.get("approved", True)))
+
+    reason = state.get("decision_reason", "")
+    if proposed == "block_ip" and final != "block_ip":
+        reason = (reason + " | Bloqueo propuesto pero rechazado por gating.").strip()
+
+    # === FAISS memory: guardar SOLO si hubo gating ===
     case_text = state.get("case_text")
     if case_text and gating.get("prompted") is True:
-        mem = get_memory()
-        if not _memory_case_exists(mem, text=case_text, label=label, episode_id=state["episode_id"]):
-            mem.add_case(
-            text=case_text,
-            label=label,
-            decision=state.get("final_decision", state.get("decision", "no_block")),
-            reason=f"gating_feedback: approved={approved}",
-            tags=["gating_feedback"],
-            source={"episode_id": state["episode_id"]},
-        )
-        approved = bool(gating.get("approved"))
-        proposed = state.get("proposed_decision", state.get("decision", "no_block"))
-        final = state.get("final_decision", proposed)
-         # Etiquetado simple basado en feedback humano:
-    # - si humano rechazó bloquear => FP
-    # - si humano aprobó bloquear => TP (en MVP, “aceptado por humano”)
         label = "TP" if approved else "FP"
-        mem.add_case(
-        text=case_text,
-        label=label,
-        decision=final,
-        reason=f"gating_feedback: approved={approved}",
-        tags=["gating_feedback"],
-        source={"episode_id": state["episode_id"]}
-    )
+        mem = get_memory()  # o get_memory(), según tu implementación
 
-    if proposed == "block_ip" and final != "block_ip":
-        reason = reason + " | Bloqueo propuesto pero rechazado por gating."
+        # dedupe: no metas el mismo caso una y otra vez
+        if not _memory_case_exists(mem, text=case_text, label=label, episode_id=ep):
+            mem.add_case(
+                text=case_text,
+                label=label,
+                decision=final,
+                reason=f"gating_feedback: approved={approved}",
+                tags=["gating_feedback"],
+                source={"episode_id": ep, "run_id": run_id},
+            )
 
     evidence = {
+        "run_id": run_id,
         "proposed_decision": proposed,
         "final_decision": final,
         "gating": gating,
+        "approved": approved,
         "detection_event": state.get("detection_event"),
         "asset_context": state.get("asset_context"),
         "memory_hits": state.get("memory_hits"),
         "correlation": state.get("correlation"),
-        "approved": state.get("approved"),
         "action_result": state.get("action_result"),
     }
 
+    # IMPORTANTe: append_decision debe poder escribir al path del run
     append_decision(
         episode_id=ep,
-        decision=final,               #  ahora el decision top-level es el FINAL
+        decision=final,
         t_detect=state.get("t_detect"),
         evidence=evidence,
         reason=reason,
+        run_id=run_id,
+        out_path=decisions_path,
+        timestamp=_iso_now(),
     )
+
     return {}
 
 
