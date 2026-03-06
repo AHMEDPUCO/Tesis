@@ -32,6 +32,9 @@ def _load_ground_truth(gt_dir: str, episode_id: int) -> Optional[Dict[str, Any]]
     return None
 
 def _get_injection_start(gt: Dict[str, Any]) -> Optional[str]:
+    # Si el episodio es benigno, no tiene sentido medir MTTD/MTTR contra inyeccion.
+    if gt.get("attack_present") is False:
+        return None
     # intenta varias llaves comunes
     if "injected_window" in gt and isinstance(gt["injected_window"], dict):
         return gt["injected_window"].get("start")

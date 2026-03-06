@@ -23,6 +23,7 @@ class Event:
 class GroundTruth:
     episode_id: int # Identificador del episodio
     seed: int      # Semilla utilizada
+    attack_present: bool   # True si hubo inyeccion Red Team en el episodio
     scenario_name: str      # Nombre del escenario
     technique_ids: List[str]     # ATT&CK IDs referenciales
     t0: str                   # Inicio del escenario

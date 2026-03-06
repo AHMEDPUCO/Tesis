@@ -1,58 +1,81 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
+import json
 import os
 from typing import Any, Dict, List, Optional, TypedDict
 
-from langgraph.graph import StateGraph, END
-import os
+try:
+    from langgraph.graph import StateGraph, END
+    _HAS_LANGGRAPH = True
+except ModuleNotFoundError:
+    StateGraph = None  # type: ignore[assignment]
+    END = None         # type: ignore[assignment]
+    _HAS_LANGGRAPH = False
 
 from src.backend_a.search_logs import search_logs
 from src.tools.asset_context import get_asset_context
 from src.tools.enforcement import _iso_now, block_ip
 from src.blue.decision_log import append_decision
-
-##Faiss memory importado pero no integrado aún (ver retrieve_memory):
 from src.memory.faiss_store import FaissMemory
 
 
-
-#-----------------faiss_memory-----------------"
-# arriba del todo
 _MEM_BY_DIR: dict[str, FaissMemory] = {}
 
-def get_memory(dir_path: str) -> FaissMemory:
-    m = _MEM_BY_DIR.get(dir_path)
-    if m is None:
-        m = FaissMemory(dir_path=dir_path)
-        _MEM_BY_DIR[dir_path] = m
-    return m
 
-# Cache global para evitar recargar el índice en cada llamada (si decides usarlo)"
-_MEM: FaissMemory | None = None
-def get_memory() -> FaissMemory:
-    global _MEM
-    if _MEM is None:
-        _MEM = FaissMemory()
-    return _MEM
-def _memory_case_exists(mem, *, text: str, label: str, episode_id: int) -> bool:
-    for c in reversed(mem.cases[-300:]):  # mira los últimos 300
-        if c.get("text") == text and c.get("label") == label and c.get("source", {}).get("episode_id") == episode_id:
+def get_memory(dir_path: str) -> FaissMemory:
+    mem = _MEM_BY_DIR.get(dir_path)
+    if mem is None:
+        mem = FaissMemory(dir_path=dir_path)
+        _MEM_BY_DIR[dir_path] = mem
+    return mem
+
+
+def _memory_dir_from_state(state: "BlueState") -> str:
+    return str(state.get("memory_dir") or os.path.join("data", "memory"))
+
+
+def _ground_truth_dir_from_state(state: "BlueState") -> str:
+    gt_dir = state.get("gt_dir")
+    if gt_dir:
+        return str(gt_dir)
+    logs_dir = str(state.get("logs_dir") or "")
+    return os.path.join(os.path.dirname(logs_dir), "ground_truth")
+
+
+def _load_ground_truth(gt_dir: str, episode_id: int) -> Optional[Dict[str, Any]]:
+    for path in (
+        os.path.join(gt_dir, f"episode_{episode_id:03d}.json"),
+        os.path.join(gt_dir, f"episode_{episode_id}.json"),
+    ):
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    return None
+
+
+def _memory_case_exists(mem: FaissMemory, *, text: str, label: str, episode_id: int) -> bool:
+    for case in reversed(mem.cases[-300:]):
+        if (
+            case.get("text") == text
+            and case.get("label") == label
+            and case.get("source", {}).get("episode_id") == episode_id
+        ):
             return True
     return False
-# --------- helpers ---------
+
 
 def parse_iso_z(ts: str) -> datetime:
     if ts.endswith("Z"):
         ts = ts[:-1] + "+00:00"
     return datetime.fromisoformat(ts).astimezone(timezone.utc)
 
+
 def iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
+
 def normalize_event(ev: Dict[str, Any]) -> Dict[str, Any]:
-    """normalize_schema: asegura llaves consistentes (aunque falten en el raw)."""
     return {
         "timestamp": ev.get("timestamp"),
         "episode_id": ev.get("episode_id"),
@@ -69,17 +92,79 @@ def normalize_event(ev: Dict[str, Any]) -> Dict[str, Any]:
         "tags": ev.get("tags") or [],
     }
 
+
 def build_case_text(ev: Dict[str, Any], asset_ctx: Dict[str, Any]) -> str:
-    a = asset_ctx.get("asset") or {}
+    asset = asset_ctx.get("asset") or {}
     tags = " ".join(ev.get("tags") or [])
     return (
         f"event_type={ev.get('event_type')} action={ev.get('action')} outcome={ev.get('outcome')} "
         f"severity={ev.get('severity')} user={ev.get('user')} src_ip={ev.get('src_ip')} "
-        f"host={ev.get('host')} role={a.get('role')} criticality={a.get('criticality')} tags={tags}"
+        f"host={ev.get('host')} role={asset.get('role')} criticality={asset.get('criticality')} tags={tags}"
     )
 
 
-# --------- state ---------
+def _memory_summary(hits: List[Dict[str, Any]]) -> Dict[str, Any]:
+    summary = {
+        "count": len(hits),
+        "tp_weight": 0.0,
+        "fp_weight": 0.0,
+        "uncertain_weight": 0.0,
+        "top_label": None,
+        "top_score": 0.0,
+        "consensus": "none",
+    }
+    if not hits:
+        return summary
+
+    top = hits[0]
+    summary["top_label"] = (top.get("case") or {}).get("label")
+    summary["top_score"] = float(top.get("score", 0.0))
+
+    for hit in hits:
+        label = ((hit.get("case") or {}).get("label") or "").upper()
+        score = float(hit.get("score", 0.0))
+        if label == "TP":
+            summary["tp_weight"] += score
+        elif label == "FP":
+            summary["fp_weight"] += score
+        elif label == "UNCERTAIN":
+            summary["uncertain_weight"] += score
+
+    max_weight = max(summary["tp_weight"], summary["fp_weight"], summary["uncertain_weight"])
+    if max_weight <= 0:
+        return summary
+    if max_weight == summary["tp_weight"]:
+        summary["consensus"] = "TP"
+    elif max_weight == summary["fp_weight"]:
+        summary["consensus"] = "FP"
+    else:
+        summary["consensus"] = "UNCERTAIN"
+    return summary
+
+
+def _baseline_decision(severity: str, criticality: str, signals: int) -> Dict[str, Any]:
+    if severity == "high" and criticality in ("high", "medium"):
+        confidence = 0.90 if signals >= 2 else 0.80
+        return {
+            "decision": "block_ip",
+            "confidence": confidence,
+            "decision_reason": "Severidad high en activo critico: contener.",
+        }
+
+    if severity == "medium" and signals >= 2:
+        return {
+            "decision": "block_ip",
+            "confidence": 0.75,
+            "decision_reason": "Evidencia suficiente (>=2 senales) con severidad medium.",
+        }
+
+    return {
+        "decision": "escalate",
+        "confidence": 0.60,
+        "decision_reason": "Evidencia parcial: escalar (sin contener automaticamente).",
+    }
+
+
 class BlueState(TypedDict, total=False):
     logs_dir: str
     episode_id: int
@@ -89,208 +174,202 @@ class BlueState(TypedDict, total=False):
     final_decision: str
     gating: Dict[str, Any]
     case_text: Optional[str]
-    # outputs intermedios
     raw_events: List[Dict[str, Any]]
-    events: List[Dict[str, Any]]           # normalized
+    events: List[Dict[str, Any]]
     detection_event: Optional[Dict[str, Any]]
     t_detect: Optional[str]
     asset_context: Dict[str, Any]
     memory_hits: List[Dict[str, Any]]
     correlation: Dict[str, Any]
-    #run context
     run_id: Optional[str]
     decisions_path: Optional[str]
     actions_path: Optional[str]
-    ##########
-    # decisión/acción
-    decision: str                          # block_ip | no_block | escalate
+    memory_dir: Optional[str]
+    gt_dir: Optional[str]
+    decision: str
     confidence: float
     decision_reason: str
     approved: bool
     action_result: Optional[Dict[str, Any]]
 
 
-# --------- nodes ---------
-SUSPICIOUS_TAGS = ["suspicious", "lateral_like", "burst", "success_after_fail", "post_auth"]
+SUSPICIOUS_TAGS = ["suspicious", "lateral_like", "success_after_fail", "post_auth"]
+
 
 def observe(state: BlueState) -> BlueState:
-    ep = state["episode_id"]
+    episode_id = state["episode_id"]
     logs_dir = state["logs_dir"]
 
-    # 1) busca señales por tags sospechosos
-    r = search_logs(logs_dir, episode_id=ep, filters={"tags_any": SUSPICIOUS_TAGS}, limit=200)
-    events = r["events"]
+    result = search_logs(logs_dir, episode_id=episode_id, filters={"tags_any": SUSPICIOUS_TAGS}, limit=200)
+    events = result["events"]
 
-    # fallback: si no hay tags, busca severidad high (más agresivo)
     if not events:
-        r2 = search_logs(logs_dir, episode_id=ep, filters={"severity": "high"}, limit=200)
-        events = r2["events"]
+        fallback = search_logs(logs_dir, episode_id=episode_id, filters={"severity": "high"}, limit=200)
+        events = fallback["events"]
 
-    # ordenar por timestamp
-    events.sort(key=lambda e: e.get("timestamp", ""))
+    events.sort(key=lambda event: event.get("timestamp", ""))
 
-    det = events[0] if events else None
-    t_detect = det["timestamp"] if det else None
+    detection_event = events[0] if events else None
+    t_detect = detection_event["timestamp"] if detection_event else None
 
-    return {"raw_events": events, "detection_event": det, "t_detect": t_detect}
+    return {"raw_events": events, "detection_event": detection_event, "t_detect": t_detect}
+
 
 def normalize_schema(state: BlueState) -> BlueState:
     raw = state.get("raw_events") or []
-    norm = [normalize_event(e) for e in raw]
-    det = state.get("detection_event")
-    det_norm = normalize_event(det) if det else None
-    return {"events": norm, "detection_event": det_norm}
+    events = [normalize_event(event) for event in raw]
+    detection_event = state.get("detection_event")
+    detection_event_norm = normalize_event(detection_event) if detection_event else None
+    return {"events": events, "detection_event": detection_event_norm}
+
 
 def enrich(state: BlueState) -> BlueState:
-    det = state.get("detection_event")
-    if not det:
+    detection_event = state.get("detection_event")
+    if not detection_event:
         return {"asset_context": {"found": False, "notes": ["no_detection_event"]}}
-    host = det.get("host") or ""
-    ctx = get_asset_context(host)
-    return {"asset_context": ctx}
+    host = detection_event.get("host") or ""
+    return {"asset_context": get_asset_context(host)}
+
 
 def retrieve_memory(state: BlueState) -> BlueState:
-    det = state.get("detection_event")
-    asset_ctx = state.get("asset_context") or {}
-
-    if not det:
+    detection_event = state.get("detection_event")
+    asset_context = state.get("asset_context") or {}
+    if not detection_event:
         return {"memory_hits": [], "case_text": None}
 
-    case_text = build_case_text(det, asset_ctx)
-
-    mem = get_memory()
+    case_text = build_case_text(detection_event, asset_context)
+    mem = get_memory(_memory_dir_from_state(state))
     hits = mem.search(text=case_text, k=3, threshold=0.78)
-
-    hits_dict = [
-        {"score": h.score, "case": h.case}
-        for h in hits
-    ]
-
-    return {"memory_hits": hits_dict, "case_text": case_text}
+    return {
+        "memory_hits": [{"score": hit.score, "case": hit.case} for hit in hits],
+        "case_text": case_text,
+    }
 
 
 def correlate(state: BlueState) -> BlueState:
-    det = state.get("detection_event")
-    if not det:
+    detection_event = state.get("detection_event")
+    if not detection_event:
         return {"correlation": {"signals": 0, "summary": "No detection event."}}
 
-    # Evidencia adicional: cuántos eventos comparten src_ip cerca de t_detect
     logs_dir = state["logs_dir"]
-    ep = state["episode_id"]
-    src_ip = det.get("src_ip")
-    t_detect = det.get("timestamp")
+    episode_id = state["episode_id"]
+    src_ip = detection_event.get("src_ip")
+    t_detect = detection_event.get("timestamp")
     signals = 1
+    window: Dict[str, Any] = {}
 
-    window = {}
     if src_ip and t_detect:
         t0 = parse_iso_z(t_detect)
         start = iso_z(t0 - timedelta(minutes=2))
         end = iso_z(t0 + timedelta(minutes=2))
-
-        rr = search_logs(
+        result = search_logs(
             logs_dir,
-            episode_id=ep,
+            episode_id=episode_id,
             start=start,
             end=end,
             filters={"src_ip": src_ip},
             limit=200,
             agg={"type": "count"},
         )
-        cnt = rr.get("aggregation", {}).get("count", 0)
-        signals = 2 if cnt >= 5 else 1
-        window = {"start": start, "end": end, "src_ip_count": cnt}
+        count = result.get("aggregation", {}).get("count", 0)
+        signals = 2 if count >= 5 else 1
+        window = {"start": start, "end": end, "src_ip_count": count}
 
-    summary = {
+    correlation = {
         "primary": {
-            "event_type": det.get("event_type"),
-            "action": det.get("action"),
-            "severity": det.get("severity"),
-            "tags": det.get("tags"),
+            "event_type": detection_event.get("event_type"),
+            "action": detection_event.get("action"),
+            "severity": detection_event.get("severity"),
+            "tags": detection_event.get("tags"),
             "src_ip": src_ip,
-            "host": det.get("host"),
+            "host": detection_event.get("host"),
         },
         "window": window,
         "signals": signals,
     }
-    return {"correlation": summary}
+    return {"correlation": correlation}
+
 
 def decide(state: BlueState) -> BlueState:
-    det = state.get("detection_event")
-    if not det:
+    detection_event = state.get("detection_event")
+    if not detection_event:
         return {
             "decision": "no_block",
             "confidence": 0.20,
-            "decision_reason": "Sin evento de detección: no se actúa."
+            "decision_reason": "Sin evento de deteccion: no se actua.",
         }
 
     asset = (state.get("asset_context") or {}).get("asset") or {}
-    crit = asset.get("criticality", "low")
-
-    tags = det.get("tags") or []
-    sev = det.get("severity", "low")
+    criticality = asset.get("criticality", "low")
+    tags = detection_event.get("tags") or []
+    severity = detection_event.get("severity", "low")
     signals = (state.get("correlation") or {}).get("signals", 1)
 
-    # 1) Allowlist override (prioridad máxima)
     allowlisted = ("allowlisted_user" in tags) or ("service_account" in tags)
     if allowlisted:
         return {
             "decision": "no_block",
             "confidence": 0.95,
-            "decision_reason": "Allowlisted/service_account: evitar falso positivo."
+            "decision_reason": "Allowlisted/service_account: evitar falso positivo.",
         }
 
-    # 2) Memoria FAISS override (segundo nivel)
+    base = _baseline_decision(severity, criticality, signals)
     hits = state.get("memory_hits") or []
-    if hits:
-        top = hits[0]
-        top_label = (top.get("case") or {}).get("label")
-        top_score = float(top.get("score", 0.0))
+    if not hits:
+        return base
 
-        # Si memoria sugiere FP con alta similitud, NO bloquear
-        if top_label == "FP" and top_score >= 0.82:
-            return {
-                "decision": "no_block",
-                "confidence": 0.88,
-                "decision_reason": f"Memoria sugiere FP similar (score={top_score:.2f}): evitar bloqueo."
-            }
+    memory = _memory_summary(hits)
+    top_score = float(memory["top_score"])
+    tp_weight = float(memory["tp_weight"])
+    fp_weight = float(memory["fp_weight"])
+    base_decision = str(base["decision"])
+    base_confidence = float(base["confidence"])
 
-        # Si memoria sugiere TP muy fuerte, favorecer bloqueo (pero con prudencia)
-        if top_label == "TP" and top_score >= 0.90:
-            # bloquea con alta confianza pero deja que gating actúe si tu umbral lo exige
+    if memory["consensus"] == "TP" and top_score >= 0.90 and tp_weight >= (fp_weight + 0.10):
+        if base_decision == "escalate":
             return {
                 "decision": "block_ip",
-                "confidence": 0.90,
-                "decision_reason": f"Memoria sugiere TP similar (score={top_score:.2f}): contener."
+                "confidence": max(base_confidence, 0.85),
+                "decision_reason": f"Memoria respalda TP fuerte (score={top_score:.2f}): contener.",
             }
-
-        # Si el match existe pero no es fuerte, se deja que la heurística decida
-        # (no hacemos return aquí)
-
-    # 3) Heurística v0 (baseline)
-    if sev == "high" and (crit in ("high", "medium")):
-        conf = 0.90 if signals >= 2 else 0.80
         return {
-            "decision": "block_ip",
-            "confidence": conf,
-            "decision_reason": "Severidad high en activo crítico: contener."
+            "decision": base_decision,
+            "confidence": max(base_confidence, 0.88),
+            "decision_reason": f"{base['decision_reason']} | Memoria consistente con TP (score={top_score:.2f}).",
         }
 
-    if sev == "medium" and signals >= 2:
+    if memory["consensus"] == "FP" and top_score >= 0.86 and fp_weight >= (tp_weight + 0.15):
+        if base_decision == "block_ip":
+            if severity == "high" and criticality in ("high", "medium") and signals >= 2:
+                return {
+                    "decision": "block_ip",
+                    "confidence": min(base_confidence, 0.82),
+                    "decision_reason": f"{base['decision_reason']} | Memoria sugiere FP, pero la evidencia actual sigue siendo fuerte.",
+                }
+            return {
+                "decision": "escalate",
+                "confidence": 0.72,
+                "decision_reason": f"Memoria sugiere FP similar (score={top_score:.2f}): pedir mayor evidencia antes de contener.",
+            }
         return {
-            "decision": "block_ip",
-            "confidence": 0.75,
-            "decision_reason": "Evidencia suficiente (>=2 señales) con severidad medium."
+            "decision": "no_block",
+            "confidence": 0.82,
+            "decision_reason": f"Memoria sugiere FP similar (score={top_score:.2f}) y la evidencia actual es debil.",
         }
 
-    return {
-        "decision": "escalate",
-        "confidence": 0.60,
-        "decision_reason": "Evidencia parcial: escalar (sin contener automáticamente)."
-    }
+    if memory["count"] >= 2:
+        return {
+            "decision": base_decision,
+            "confidence": max(0.55, base_confidence - 0.08),
+            "decision_reason": f"{base['decision_reason']} | Memoria mixta o insuficiente; se prioriza la heuristica base.",
+        }
+
+    return base
+
 
 def act(state: BlueState) -> BlueState:
     proposed = state.get("decision", "no_block")
-    det = state.get("detection_event") or {}
+    detection_event = state.get("detection_event") or {}
     t_detect = state.get("t_detect")
     delay = int(state.get("response_delay_sec", 30))
     interactive = bool(state.get("interactive", True))
@@ -301,21 +380,18 @@ def act(state: BlueState) -> BlueState:
     action_result = None
 
     if proposed == "block_ip":
-        conf = float(state.get("confidence", 0.0))
-
-        # gating simple: si conf < 0.8, pide aprobación
-        if conf < 0.80 and interactive:
+        confidence = float(state.get("confidence", 0.0))
+        if confidence < 0.80 and interactive:
             gating["prompted"] = True
-            ans = input(f"[GATING] Bloquear IP? confidence={conf:.2f} (y/n): ").strip().lower()
-            approved = (ans == "y")
+            answer = input(f"[GATING] Bloquear IP? confidence={confidence:.2f} (y/n): ").strip().lower()
+            approved = (answer == "y")
             gating["approved"] = approved
             if not approved:
                 gating["reason"] = "human_rejected"
-                final_decision = "escalate"   # bloque propuesto, pero NO ejecutado
+                final_decision = "escalate"
 
-        # ejecuta acción solo si aprobado
         if approved:
-            src_ip = det.get("src_ip")
+            src_ip = detection_event.get("src_ip")
             if src_ip and t_detect:
                 t0 = parse_iso_z(t_detect)
                 t_block = iso_z(t0 + timedelta(seconds=delay))
@@ -344,16 +420,12 @@ def act(state: BlueState) -> BlueState:
 
 
 def log(state: BlueState) -> BlueState:
-    ep = state["episode_id"]
-
-    # === Run context (para no mezclar corridas) ===
+    episode_id = state["episode_id"]
     run_id = state.get("run_id")
     decisions_path = state.get("decisions_path") or os.path.join("data", "runs", run_id or "unknown_run", "decisions.jsonl")
-    actions_path = state.get("actions_path") or os.path.join("data", "runs", run_id or "unknown_run", "enforcement_actions.jsonl")
-    # === decisiones ===
+
     proposed = state.get("proposed_decision", state.get("decision", "no_block"))
     final = state.get("final_decision", proposed)
-
     gating = state.get("gating") or {}
     approved = bool(gating.get("approved", state.get("approved", True)))
 
@@ -361,22 +433,51 @@ def log(state: BlueState) -> BlueState:
     if proposed == "block_ip" and final != "block_ip":
         reason = (reason + " | Bloqueo propuesto pero rechazado por gating.").strip()
 
-    # === FAISS memory: guardar SOLO si hubo gating ===
     case_text = state.get("case_text")
-    if case_text and gating.get("prompted") is True:
-        label = "TP" if approved else "FP"
-        mem = get_memory()  # o get_memory(), según tu implementación
+    if case_text:
+        gt = _load_ground_truth(_ground_truth_dir_from_state(state), episode_id)
+        attack_present = bool((gt or {}).get("attack_present"))
+        signals = int((state.get("correlation") or {}).get("signals", 1))
+        severity = str(((state.get("detection_event") or {}).get("severity")) or "low")
+        tags = list(((state.get("detection_event") or {}).get("tags")) or [])
 
-        # dedupe: no metas el mismo caso una y otra vez
-        if not _memory_case_exists(mem, text=case_text, label=label, episode_id=ep):
-            mem.add_case(
-                text=case_text,
-                label=label,
-                decision=final,
-                reason=f"gating_feedback: approved={approved}",
-                tags=["gating_feedback"],
-                source={"episode_id": ep, "run_id": run_id},
-            )
+        label: Optional[str] = None
+        learned_decision: Optional[str] = None
+        learned_reason: Optional[str] = None
+        learned_tags: List[str] = []
+
+        if gt is not None:
+            if attack_present:
+                label = "TP"
+                learned_decision = "block_ip" if (severity == "high" or signals >= 2) else "escalate"
+                learned_reason = "ground_truth_attack_present"
+                learned_tags = ["ground_truth_feedback", "attack_present"]
+            else:
+                label = "FP"
+                learned_decision = "no_block" if signals <= 1 else "escalate"
+                learned_reason = "ground_truth_benign"
+                learned_tags = ["ground_truth_feedback", "benign"]
+                if "service_account" in tags or "allowlisted_user" in tags:
+                    learned_tags.append("allowlist_pattern")
+
+        if gating.get("prompted") is True and label is None:
+            label = "TP" if approved else "FP"
+            learned_decision = final
+            learned_reason = f"gating_feedback: approved={approved}"
+            learned_tags = ["gating_feedback"]
+
+        if label and learned_decision and learned_reason:
+            mem = get_memory(_memory_dir_from_state(state))
+            if not _memory_case_exists(mem, text=case_text, label=label, episode_id=episode_id):
+                mem.add_case(
+                    text=case_text,
+                    label=label,
+                    decision=learned_decision,
+                    reason=learned_reason,
+                    tags=learned_tags,
+                    confidence=state.get("confidence"),
+                    source={"episode_id": episode_id, "run_id": run_id},
+                )
 
     evidence = {
         "run_id": run_id,
@@ -391,9 +492,8 @@ def log(state: BlueState) -> BlueState:
         "action_result": state.get("action_result"),
     }
 
-    # IMPORTANTe: append_decision debe poder escribir al path del run
     append_decision(
-        episode_id=ep,
+        episode_id=episode_id,
         decision=final,
         t_detect=state.get("t_detect"),
         evidence=evidence,
@@ -406,27 +506,36 @@ def log(state: BlueState) -> BlueState:
     return {}
 
 
-
 def build_blue_graph():
-    g = StateGraph(BlueState)
-    g.add_node("observe", observe)
-    g.add_node("normalize_schema", normalize_schema)
-    g.add_node("enrich", enrich)
-    g.add_node("retrieve_memory", retrieve_memory)
-    g.add_node("correlate", correlate)
-    g.add_node("decide", decide)
-    g.add_node("act", act)
-    g.add_node("log", log)
+    if not _HAS_LANGGRAPH:
+        raise RuntimeError("langgraph no esta instalado; usa run_blue_episode(state) como fallback.")
 
-    g.set_entry_point("observe")
-    g.add_edge("observe", "normalize_schema")
-    g.add_edge("normalize_schema", "enrich")
-    g.add_edge("enrich", "retrieve_memory")
-    g.add_edge("retrieve_memory", "correlate")
-    g.add_edge("correlate", "decide")
-    g.add_edge("decide", "act")
-    g.add_edge("act", "log")
-    g.add_edge("log", END)
+    graph = StateGraph(BlueState)
+    graph.add_node("observe", observe)
+    graph.add_node("normalize_schema", normalize_schema)
+    graph.add_node("enrich", enrich)
+    graph.add_node("retrieve_memory", retrieve_memory)
+    graph.add_node("correlate", correlate)
+    graph.add_node("decide", decide)
+    graph.add_node("act", act)
+    graph.add_node("log", log)
 
-    return g.compile()
-## PARA EJECUTAR BLUE AGENT python -m src.blue.run_blue_agent --episode-id 2
+    graph.set_entry_point("observe")
+    graph.add_edge("observe", "normalize_schema")
+    graph.add_edge("normalize_schema", "enrich")
+    graph.add_edge("enrich", "retrieve_memory")
+    graph.add_edge("retrieve_memory", "correlate")
+    graph.add_edge("correlate", "decide")
+    graph.add_edge("decide", "act")
+    graph.add_edge("act", "log")
+    graph.add_edge("log", END)
+
+    return graph.compile()
+
+
+def run_blue_episode(state: BlueState) -> BlueState:
+    current: BlueState = dict(state)
+    for fn in (observe, normalize_schema, enrich, retrieve_memory, correlate, decide, act, log):
+        out = fn(current) or {}
+        current.update(out)
+    return current

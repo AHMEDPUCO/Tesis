@@ -103,6 +103,7 @@ class FaissMemory:
         decision: str,     # "block_ip" | "no_block" | "escalate"
         reason: str,
         tags: Optional[List[str]] = None,
+        confidence: Optional[float] = None,
         source: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         case_id = (self.cases[-1]["case_id"] + 1) if self.cases else 1
@@ -114,6 +115,7 @@ class FaissMemory:
             "decision": decision,
             "reason": reason,
             "tags": tags or [],
+            "confidence": confidence,
             "source": source or {},
         }
 

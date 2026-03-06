@@ -1,7 +1,7 @@
 from __future__ import annotations
 import argparse
 import os
-from src.blue.blue_agent_graph import build_blue_graph
+from src.blue.blue_agent_graph import build_blue_graph, run_blue_episode
 from src.core.run_manager import new_run_id, prepare_run
 
 def main():
@@ -10,6 +10,7 @@ def main():
     ap.add_argument("--run-id", type=str, default=None)
     ap.add_argument("--clean-run", action="store_true")
     ap.add_argument("--logs-dir", type=str, default="data/logs_backend_a")
+    ap.add_argument("--gt-dir", type=str, default="data/ground_truth")
     ap.add_argument("--delay", type=int, default=30)
     ap.add_argument("--non-interactive", action="store_true")
     args = ap.parse_args()
@@ -18,10 +19,10 @@ def main():
     paths = prepare_run(run_id, clean=args.clean_run, meta={"component": "blue_agent"})
     memory_dir = os.path.join(paths["base"], "memory")
 
-    app = build_blue_graph()
     state = {
         "episode_id": args.episode_id,
         "logs_dir": args.logs_dir,
+        "gt_dir": args.gt_dir,
         "response_delay_sec": args.delay,
         "interactive": not args.non_interactive,
 
@@ -31,7 +32,11 @@ def main():
         "memory_dir": memory_dir,
     }
 
-    out = app.invoke(state)
+    try:
+        app = build_blue_graph()
+        out = app.invoke(state)
+    except RuntimeError:
+        out = run_blue_episode(state)
     print(f"✅ Blue Agent finished. run_id={run_id}. Final state keys: {list(out.keys())}")
 
 if __name__ == "__main__":

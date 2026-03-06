@@ -99,9 +99,9 @@ def background_noise_events(
                 timestamp=iso(dt),
                 episode_id=episode_id, seed=seed,
                 event_type="auth",
-                host=asset["host"],
+                host=asset.host,
                 user=user,
-                src_ip=asset["ip"],
+                src_ip=asset.ip,
                 dst_ip=None,
                 action="login_attempt",
                 outcome="fail",
@@ -252,6 +252,8 @@ def main() -> None:
     ap.add_argument("--base-seed", type=int, default=1337)
     ap.add_argument("--noise-per-episode", type=int, default=2000,
                    help="Eventos benignos por episodio")
+    ap.add_argument("--benign-rate", type=float, default=0.0,
+                    help="Fraccion de episodios sin inyeccion Red Team (0.0-1.0).")
     args = ap.parse_args()
 
     logs_dir = os.path.join(args.out, "logs_backend_a")
@@ -265,14 +267,22 @@ def main() -> None:
         seed = args.base_seed + ep
         rng = random.Random(seed)
 
-        scenario = SCENARIOS[(ep - 1) % len(SCENARIOS)]
+        attack_present = (rng.random() >= args.benign_rate)
+        scenario = SCENARIOS[(ep - 1) % len(SCENARIOS)] if attack_present else {
+            "name": "benign",
+            "technique_ids": [],
+            "description": "Episodio benigno (sin inyeccion).",
+        }
         t0 = base_start + timedelta(minutes=ep * 10)
 
         events = background_noise_events(rng, ep, seed, t0, args.noise_per_episode)
-        injected_events, injected_window, expected_indicators = inject_scenario_events(
-            rng, ep, seed, t0, scenario
-        )
-        events.extend(injected_events)
+        injected_window = {"start": iso(t0), "end": iso(t0)}
+        expected_indicators = {"src_ips": [], "dst_ips": [], "hosts": [], "users": []}
+        if attack_present:
+            injected_events, injected_window, expected_indicators = inject_scenario_events(
+                rng, ep, seed, t0, scenario
+            )
+            events.extend(injected_events)
         events.sort(key=lambda e: e.timestamp)
 
         log_path = os.path.join(logs_dir, f"episode_{ep:03d}.jsonl")
@@ -283,6 +293,7 @@ def main() -> None:
         gt = GroundTruth(
             episode_id=ep,
             seed=seed,
+            attack_present=attack_present,
             scenario_name=scenario["name"],
             technique_ids=scenario["technique_ids"],
             t0=iso(t0),
