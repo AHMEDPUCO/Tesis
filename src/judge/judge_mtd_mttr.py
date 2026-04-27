@@ -8,6 +8,15 @@ def _parse_iso_z(ts: str) -> datetime:
         ts = ts[:-1] + "+00:00"
     return datetime.fromisoformat(ts).astimezone(timezone.utc)
 
+
+def _delta_seconds(start_ts: Optional[str], end_ts: Optional[str]) -> Optional[float]:
+    if not start_ts or not end_ts:
+        return None
+    try:
+        return (_parse_iso_z(end_ts) - _parse_iso_z(start_ts)).total_seconds()
+    except Exception:
+        return None
+
 def _read_jsonl(path: str) -> List[Dict[str, Any]]:
     out = []
     if not os.path.exists(path):
@@ -77,13 +86,20 @@ def judge_mttd_mttr(
         t_detect = d.get("t_detect")
         t_block = _first_block_time(actions, ep_id)
 
-        mttd = None
-        mttr = None
+        mttd_raw = _delta_seconds(inj_start, t_detect)
+        mttr_raw = _delta_seconds(inj_start, t_block)
+        anomaly: List[str] = []
 
-        if inj_start and t_detect:
-            mttd = (_parse_iso_z(t_detect) - _parse_iso_z(inj_start)).total_seconds()
-        if inj_start and t_block:
-            mttr = (_parse_iso_z(t_block) - _parse_iso_z(inj_start)).total_seconds()
+        mttd = mttd_raw
+        mttr = mttr_raw
+        # Sanitiza el reporte principal para que no salgan tiempos negativos.
+        # Se preserva el valor crudo en columnas *_raw para diagnostico.
+        if mttd is not None and mttd < 0:
+            anomaly.append("negative_mttd")
+            mttd = 0.0
+        if mttr is not None and mttr < 0:
+            anomaly.append("negative_mttr")
+            mttr = 0.0
 
         rows.append({
             "episode_id": ep_id,
@@ -91,13 +107,25 @@ def judge_mttd_mttr(
             "inj_start": inj_start,
             "t_detect": t_detect,
             "t_block": t_block ,
+            "MTTD_seconds_raw": mttd_raw,
+            "MTTR_seconds_raw": mttr_raw,
             "MTTD_seconds": mttd,
             "MTTR_seconds": mttr,
+            "timing_anomaly": ",".join(anomaly),
         })
 
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [
-            "episode_id","decision","inj_start","t_detect","t_block","MTTD_seconds","MTTR_seconds"
+            "episode_id",
+            "decision",
+            "inj_start",
+            "t_detect",
+            "t_block",
+            "MTTD_seconds_raw",
+            "MTTR_seconds_raw",
+            "MTTD_seconds",
+            "MTTR_seconds",
+            "timing_anomaly",
         ])
         w.writeheader()
         for r in rows:

@@ -10,6 +10,8 @@ import numpy as np
 import faiss  # faiss-cpu
 from sentence_transformers import SentenceTransformer
 
+_MODEL_BY_NAME: Dict[str, SentenceTransformer] = {}
+
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -18,6 +20,14 @@ def _iso_now() -> str:
 def _l2_normalize(v: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(v, axis=1, keepdims=True) + 1e-12
     return v / n
+
+
+def _get_embedding_model(model_name: str) -> SentenceTransformer:
+    model = _MODEL_BY_NAME.get(model_name)
+    if model is None:
+        model = SentenceTransformer(model_name)
+        _MODEL_BY_NAME[model_name] = model
+    return model
 
 
 @dataclass
@@ -44,7 +54,7 @@ class FaissMemory:
         self.index_path = os.path.join(dir_path, "index.faiss")
         os.makedirs(self.dir_path, exist_ok=True)
 
-        self.model = SentenceTransformer(model_name)
+        self.model = _get_embedding_model(model_name)
         self.dim = self.model.get_sentence_embedding_dimension()
 
         self.cases: List[Dict[str, Any]] = []

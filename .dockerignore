@@ -1,9 +1,18 @@
-# Local Python environments
+# Version control and local editor state
+.git/
+.github/
+.gitignore
+.dockerignore
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python environments and caches
 .venv/
 venv/
 env/
-
-# Python caches and tooling
+.env/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -16,16 +25,16 @@ __pycache__/
 .coverage.*
 htmlcov/
 .cache/
+pip-wheel-metadata/
 
-# Build/package artifacts
+# Build and package artifacts
 build/
 dist/
 *.egg-info/
 site/
 
-# Generated datasets, experiment runs, and runtime outputs
-data/*
-!data/.gitkeep
+# Generated experiment data and runtime artifacts
+data/
 runs/
 logs/
 outputs/
@@ -34,10 +43,12 @@ reports/
 *.log
 *.tmp
 tmp_*
-tmp_thesis_extract.txt
+*.bak
+*.old
 
-# Local notes/documents not needed for code reproducibility
+# Local notes and thesis extraction scratch files
 notas.txt
+tmp_thesis_extract.txt
 *.docx
 *.pdf
 *.pptx
@@ -56,7 +67,7 @@ credentials/
 *.key
 *.crt
 
-# Model, embedding, vector store, and database artifacts
+# Large model/vector/database artifacts
 models/
 checkpoints/
 model_cache/
@@ -77,10 +88,18 @@ wandb/
 *.sqlite3
 *.db
 *.parquet
+*.csv
+*.jsonl
 
-# IDE and OS files
-.vscode/
-.idea/
+# Archives and large exports
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+
+# OS metadata
 .DS_Store
 Thumbs.db
 desktop.ini

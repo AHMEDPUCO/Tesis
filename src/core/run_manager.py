@@ -5,13 +5,61 @@ from uuid import uuid4
 from typing import Dict
 
 
+RUNS_DIR_ENV = "CYBER_RANGE_RUNS_DIR"
+_RESOLVED_RUNS_ROOT: str | None = None
+
+
 def new_run_id(prefix: str = "run") -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     return f"{prefix}_{ts}_{uuid4().hex[:8]}"
 
 
+def _is_writable_directory(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".write_probe")
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def runs_root() -> str:
+    global _RESOLVED_RUNS_ROOT
+    if _RESOLVED_RUNS_ROOT:
+        return _RESOLVED_RUNS_ROOT
+
+    explicit = os.getenv(RUNS_DIR_ENV)
+    candidates = [explicit] if explicit else []
+    candidates.extend([
+        os.path.join("data", "runs"),
+        os.path.join("data", "experiments", "_runs"),
+    ])
+
+    seen: set[str] = set()
+    for raw in candidates:
+        if not raw:
+            continue
+        path = os.path.normpath(raw)
+        if path in seen:
+            continue
+        seen.add(path)
+        if _is_writable_directory(path):
+            _RESOLVED_RUNS_ROOT = path
+            os.environ[RUNS_DIR_ENV] = path
+            return path
+
+    fallback = os.path.normpath(os.path.join("data", "experiments", "_runs"))
+    os.makedirs(fallback, exist_ok=True)
+    _RESOLVED_RUNS_ROOT = fallback
+    os.environ[RUNS_DIR_ENV] = fallback
+    return fallback
+
+
 def run_dir(run_id: str) -> str:
-    return os.path.join("data", "runs", run_id)
+    return os.path.join(runs_root(), run_id)
 
 
 def run_paths(run_id: str) -> Dict[str, str]:

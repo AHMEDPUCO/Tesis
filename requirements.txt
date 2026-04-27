@@ -1,3 +1,11 @@
-#Genración de episodios
-ruff==0.8.4
-pytest==8.3.4
+# Runtime dependencies for experiment generation, Blue Team execution,
+# FAISS memory, schema normalization, and result aggregation.
+numpy==2.4.2
+faiss-cpu==1.13.2
+sentence-transformers==5.2.2
+torch==2.10.0
+transformers==5.1.0
+scikit-learn==1.8.0
+scipy==1.17.0
+huggingface-hub==1.4.1
+tqdm==4.67.3
